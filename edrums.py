@@ -5,6 +5,8 @@ Reads pad hits from the Linux joystick device, plays acoustic drum
 samples (CC0 "Virtuosity Drums", prepared by fetch_samples.py) and writes
 the mix straight to ALSA via ctypes with a tiny buffer.
 
+The D-pad switches between four kits (see KITS).
+
 Usage: python3 edrums.py [/dev/input/jsN]
 """
 import array
@@ -34,15 +36,29 @@ KIT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "kit")
 # Ask PipeWire's ALSA plugin for a small quantum (default is 1024 = 21 ms).
 os.environ.setdefault("PIPEWIRE_LATENCY", f"{BLOCK}/{RATE}")
 
-# Joystick button index -> (pad name, sound name)
+# Joystick button index -> (pad name, sound slot)
 PADS = {
     2: ("red", "snare"),
     3: ("yellow", "hihat"),
     0: ("blue", "tom"),
-    1: ("green", "crash"),
+    1: ("green", "cymbal"),
     4: ("kick", "kick"),
 }
-# Button 7 fires along with every pad hit; ignored.
+# Button 7 fires along with every pad hit; ignored. The 1/2/A/B buttons
+# share indices 0-3 with the pads, so they trigger sounds too.
+
+# D-pad (hat axes) -> kit, as (axis, value): axis 4 = left/right, 5 = up/down
+KITS = {
+    (5, -32767): "studio",  # up (default)
+    (4, -32767): "jazz",    # left
+    (4, 32767): "rock",     # right
+    (5, 32767): "lofi",     # down
+}
+DEFAULT_KIT = "studio"
+
+# +/- buttons -> master volume step in dB
+VOLUME_BUTTONS = {9: +3, 8: -3}
+VOLUME_RANGE_DB = (-30, 6)  # above 0 dB loud hits saturate (soft distortion)
 
 
 def load_wav(path):
@@ -59,10 +75,10 @@ def load_wav(path):
 class Sound:
     """Round-robin over the recorded variants of one kit piece."""
 
-    def __init__(self, name):
-        files = sorted(glob.glob(os.path.join(KIT_DIR, f"{name}_*.wav")))
+    def __init__(self, kit, name):
+        files = sorted(glob.glob(os.path.join(KIT_DIR, kit, f"{name}_*.wav")))
         if not files:
-            sys.exit(f"No samples for '{name}' in {KIT_DIR}. Run fetch_samples.py first.")
+            sys.exit(f"No samples for '{kit}/{name}' in {KIT_DIR}. Run fetch_samples.py first.")
         self.variants = [load_wav(f) for f in files]
         self.next = 0
 
@@ -78,6 +94,7 @@ class Mixer:
     def __init__(self):
         self.voices = []  # [samples, pos]
         self.lock = threading.Lock()
+        self.gain = 1.0  # master volume, set from the main thread
 
     def trigger(self, samples):
         with self.lock:
@@ -96,10 +113,13 @@ class Mixer:
             with self.lock:
                 voices = list(self.voices)
             mix = silence
+            gain = self.gain
             for v in voices:
                 chunk = v[0][v[1]:v[1] + n]
                 if len(chunk) < n:
                     chunk += silence[len(chunk):]
+                if gain != 1.0:  # scale each voice before summing, so turning
+                    chunk = audioop.mul(chunk, 2, gain)  # down avoids clipping
                 mix = audioop.add(mix, chunk, 2)
                 v[1] += n
             with self.lock:
@@ -142,23 +162,36 @@ class AlsaOut:
 
 def main():
     dev = sys.argv[1] if len(sys.argv) > 1 else "/dev/input/js0"
-    print("Loading kit...", flush=True)
-    sounds = {name: Sound(name) for _, name in PADS.values()}
+    print("Loading kits...", flush=True)
+    kits = {kit: {slot: Sound(kit, slot) for _, slot in PADS.values()}
+            for kit in KITS.values()}
+    kit = DEFAULT_KIT
+    volume_db = 0
 
     out = AlsaOut()
     mixer = Mixer()
     threading.Thread(target=mixer.run, args=(out,), daemon=True).start()
 
     fd = os.open(dev, os.O_RDONLY)
-    print(f"Listening on {dev}. Hit the pads! Ctrl+C to quit.", flush=True)
+    print(f"Listening on {dev}. Kit: {kit}. D-pad switches kits "
+          "(up studio, left jazz, right rock, down lofi), +/- volume. "
+          "Ctrl+C to quit.", flush=True)
     try:
         while True:
             select.select([fd], [], [])
             _, value, etype, num = struct.unpack("IhBB", os.read(fd, 8))
             if etype == 1 and value == 1 and num in PADS:  # button press, not init
-                pad, sound = PADS[num]
-                mixer.trigger(sounds[sound].pick())
-                print(f"{pad:>6} -> {sound}", flush=True)
+                pad, slot = PADS[num]
+                mixer.trigger(kits[kit][slot].pick())
+                print(f"{pad:>6} -> {kit}/{slot}", flush=True)
+            elif etype == 1 and value == 1 and num in VOLUME_BUTTONS:
+                lo, hi = VOLUME_RANGE_DB
+                volume_db = max(lo, min(hi, volume_db + VOLUME_BUTTONS[num]))
+                mixer.gain = 10 ** (volume_db / 20)
+                print(f"=== volume: {volume_db:+d} dB ===", flush=True)
+            elif etype == 2 and (num, value) in KITS:  # D-pad pressed
+                kit = KITS[(num, value)]
+                print(f"=== kit: {kit} ===", flush=True)
     except KeyboardInterrupt:
         pass
     finally:
