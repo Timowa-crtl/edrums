@@ -15,7 +15,15 @@ import select
 import struct
 import sys
 import threading
+import warnings
 import wave
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    try:
+        import audioop  # stdlib up to Python 3.12
+    except ImportError:  # 3.13+: pip install audioop-lts
+        sys.exit("Needs the audioop module: on Python 3.13+ run `pip install audioop-lts`.")
 
 RATE = 48000  # PipeWire's native rate, avoids resampling
 CHANNELS = 2
@@ -45,7 +53,7 @@ def load_wav(path):
     peak = max(map(abs, pcm))
     onset = next(i for i, s in enumerate(pcm) if abs(s) > peak * 0.05)
     start = max(0, onset // CHANNELS - RATE // 2000) * CHANNELS  # keep 0.5 ms
-    return pcm[start:]
+    return pcm[start:].tobytes()
 
 
 class Sound:
@@ -78,24 +86,25 @@ class Mixer:
                 self.voices.pop(0)
 
     def run(self, out):
-        n = BLOCK * CHANNELS
+        # Mixing must stay far below the 1.3 ms block budget: if it gets close,
+        # one hiccup causes an underrun, PipeWire's restart stalls ~0.25 s and
+        # the mixer never catches up again (endless "zip-zip"). audioop.add
+        # sums 16-bit PCM in C with saturation, so we never loop per sample.
+        n = BLOCK * CHANNELS * 2  # bytes per block
+        silence = bytes(n)
         while True:
             with self.lock:
                 voices = list(self.voices)
-            mix = [0] * n
+            mix = silence
             for v in voices:
                 chunk = v[0][v[1]:v[1] + n]
-                if len(chunk) == n:
-                    mix = [a + b for a, b in zip(mix, chunk)]
-                else:
-                    for i, s in enumerate(chunk):
-                        mix[i] += s
+                if len(chunk) < n:
+                    chunk += silence[len(chunk):]
+                mix = audioop.add(mix, chunk, 2)
                 v[1] += n
             with self.lock:
                 self.voices = [v for v in self.voices if v[1] < len(v[0])]
-            buf = array.array("h", (32767 if s > 32767 else -32767 if s < -32767 else s
-                                    for s in mix))
-            out.write(buf)  # blocks when the small ALSA buffer is full
+            out.write(mix)  # blocks when the small ALSA buffer is full
 
 
 class AlsaOut:
@@ -118,16 +127,14 @@ class AlsaOut:
         if err < 0:
             raise RuntimeError(f"ALSA: {self.lib.snd_strerror(err).decode()}")
 
-    def write(self, buf):
-        ptr, n = buf.buffer_info()
-        frames = n // CHANNELS
-        while frames > 0:
-            r = self.lib.snd_pcm_writei(self.pcm, ctypes.c_void_p(ptr), frames)
+    def write(self, data):
+        frame_bytes = CHANNELS * 2
+        while data:
+            r = self.lib.snd_pcm_writei(self.pcm, data, len(data) // frame_bytes)
             if r < 0:  # underrun etc.: recover and carry on
                 self._check(self.lib.snd_pcm_recover(self.pcm, r, 1))
                 continue
-            ptr += r * CHANNELS * 2
-            frames -= r
+            data = data[r * frame_bytes:]
 
     def close(self):
         self.lib.snd_pcm_close(self.pcm)
