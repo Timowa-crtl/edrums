@@ -17,6 +17,11 @@ A simple, low-latency drum module ("drum brain") for the Rock Band 1 drum kit
 ## Files
 
 - `edrums.py`: the drum module (joystick input, mixer, ALSA output).
+- `install-service.sh`: installs `/etc/systemd/system/edrums.service`
+  (runs as the user, starts at boot, `Restart=always`). On the dev Pi it is
+  installed with `plughw:Headset`, so stop it
+  (`sudo systemctl stop edrums`) before running `edrums.py` by hand,
+  otherwise the card is busy.
 - `fetch_samples.py`: one-time download/preparation of the sample kits into
   `kit/` (gitignored). Samples must be 48 kHz, stereo, 16-bit.
 

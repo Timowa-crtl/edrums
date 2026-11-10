@@ -28,6 +28,25 @@ Each hit prints its latency, e.g. `red -> studio/snare  8.1 ms (last 50:
 avg ...)`: time from reading the pad event to the sound reaching the audio
 output. The drum kit's USB polling comes on top (see below).
 
+### Start at boot (systemd)
+
+To make the Pi behave like a real drum module (power on, play):
+
+```sh
+./install-service.sh plughw:Headset   # sound card as for -d; omit for "default"
+```
+
+This installs and starts `/etc/systemd/system/edrums.service`, running as
+your user. It starts at boot and restarts within 2 s whenever the script
+exits, so unplugging and replugging the drum kit or sound card just works.
+
+```sh
+journalctl -u edrums -f               # live output incl. per-hit latency
+sudo systemctl stop edrums            # stop (e.g. to run edrums.py by hand;
+sudo systemctl start edrums           #   both at once: "Device or resource busy")
+sudo systemctl disable --now edrums && sudo rm /etc/systemd/system/edrums.service   # remove
+```
+
 Requires `libasound.so.2` and `libsndfile.so.1` (both present on a stock Ubuntu
 desktop) and the `audioop` module (stdlib up to Python 3.12; on 3.13+
 `pip install audioop-lts`).
